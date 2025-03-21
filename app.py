@@ -8,7 +8,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 import time
 import requests
 import os
-import cv2
+from PIL import Image
 import numpy as np
 import json
 import math
@@ -73,19 +73,17 @@ def download_image(url, img_path, headers, timeout=10):
             os.remove(img_path)
         return False
 
+from PIL import Image
+
 def enhance_annotation(img_path, original_alt):
     """Enhance image annotation using CLIP model"""
     if model is None or processor is None:
         return original_alt
-        
+
     try:
-        image = cv2.imread(img_path)
-        if image is None:
-            return original_alt
-            
-        # Convert BGR to RGB (CLIP expects RGB)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
+        # Open the image using PIL and convert to RGB (CLIP expects RGB)
+        image = Image.open(img_path).convert("RGB")
+
         # Provide a set of candidate annotations based on the query context
         candidate_texts = [
             "a photo of nature", 
@@ -102,21 +100,22 @@ def enhance_annotation(img_path, original_alt):
             "an autumn forest",
             "a tropical island"
         ]
-        
+
         inputs = processor(text=candidate_texts, images=image, return_tensors="pt", padding=True)
         outputs = model(**inputs)
         logits_per_image = outputs.logits_per_image.softmax(dim=1)
         best_idx = logits_per_image.argmax().item()
         best_match = candidate_texts[best_idx]
-        
+
         # Combine original alt text with CLIP annotation
         enhanced = f"{original_alt} {best_match}" if original_alt else best_match
         print(f"Enhanced annotation: '{original_alt}' -> '{enhanced}'")
         return enhanced
-        
+
     except Exception as e:
         print(f"Error enhancing annotation: {e}")
         return original_alt
+
 
 def setup_chrome_driver():
     """Setup and return a configured Chrome WebDriver"""
