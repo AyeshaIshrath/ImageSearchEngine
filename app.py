@@ -17,7 +17,7 @@ import random
 from collections import defaultdict
 from flask import Flask, request, render_template_string, send_from_directory
 from transformers import CLIPProcessor, CLIPModel  # For image annotation
-
+app = Flask(__name__)
 # ---------------------------
 # Load CLIP Model for Image Annotation
 # ---------------------------
