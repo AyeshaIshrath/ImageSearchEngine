@@ -2,7 +2,7 @@ selenium
 gunicorn
 webdriver-manager
 requests
-opencv-python
+pillow
 numpy
 flask
 transformers
