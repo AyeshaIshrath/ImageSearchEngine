@@ -15,8 +15,12 @@ import math
 import re
 import random
 from collections import defaultdict
-from flask import Flask, request, render_template_string, send_from_directory
+from flask import Flask, request, render_template_string, send_from_directory, redirect, url_for
 from transformers import CLIPProcessor, CLIPModel  # For image annotation
+# Add these imports at the top of the file, after the existing imports
+import numpy as np
+import math
+from collections import defaultdict
 app = Flask(__name__)
 # ---------------------------
 # Load CLIP Model for Image Annotation
@@ -473,6 +477,214 @@ def compute_bm25(query, documents, k1=1.5, b=0.75):
     # Sort by score in descending order
     return sorted(results, key=lambda x: x["score"], reverse=True)
 
+# Add the evaluation metrics functions after the compute_bm25 function
+def compute_precision_at_k(relevant_docs, retrieved_docs, k=5):
+    """
+    Compute Precision@k: the proportion of relevant documents in the top-k results
+    
+    Args:
+        relevant_docs: List of relevant document IDs
+        retrieved_docs: List of retrieved document IDs in ranked order
+        k: Number of top results to consider
+        
+    Returns:
+        Precision@k score (float)
+    """
+    if not retrieved_docs or k <= 0:
+        return 0.0
+    
+    # Consider only top k documents
+    top_k_docs = retrieved_docs[:k]
+    
+    # Count relevant documents in top k
+    relevant_in_top_k = sum(1 for doc in top_k_docs if doc in relevant_docs)
+    
+    # Calculate precision
+    return relevant_in_top_k / k
+
+def compute_average_precision(relevant_docs, retrieved_docs):
+    """
+    Compute Average Precision: the average of precision values at each relevant document
+    
+    Args:
+        relevant_docs: List of relevant document IDs
+        retrieved_docs: List of retrieved document IDs in ranked order
+        
+    Returns:
+        Average Precision score (float)
+    """
+    if not relevant_docs or not retrieved_docs:
+        return 0.0
+    
+    relevant_count = 0
+    sum_precision = 0.0
+    
+    for i, doc in enumerate(retrieved_docs):
+        # If the current document is relevant
+        if doc in relevant_docs:
+            relevant_count += 1
+            # Precision at current position (i+1 because i is 0-indexed)
+            precision_at_i = relevant_count / (i + 1)
+            sum_precision += precision_at_i
+    
+    # If no relevant documents were retrieved
+    if relevant_count == 0:
+        return 0.0
+    
+    # Average precision
+    return sum_precision / len(relevant_docs)
+
+def compute_mean_average_precision(all_queries_relevant_docs, all_queries_retrieved_docs):
+    """
+    Compute Mean Average Precision (MAP): the mean of average precision scores over all queries
+    
+    Args:
+        all_queries_relevant_docs: Dictionary mapping query IDs to lists of relevant document IDs
+        all_queries_retrieved_docs: Dictionary mapping query IDs to lists of retrieved document IDs
+        
+    Returns:
+        MAP score (float)
+    """
+    if not all_queries_relevant_docs:
+        return 0.0
+    
+    sum_ap = 0.0
+    query_count = 0
+    
+    for query_id in all_queries_relevant_docs:
+        if query_id in all_queries_retrieved_docs:
+            relevant_docs = all_queries_relevant_docs[query_id]
+            retrieved_docs = all_queries_retrieved_docs[query_id]
+            
+            ap = compute_average_precision(relevant_docs, retrieved_docs)
+            sum_ap += ap
+            query_count += 1
+    
+    # If no queries were evaluated
+    if query_count == 0:
+        return 0.0
+    
+    # Mean average precision
+    return sum_ap / query_count
+
+def compute_ndcg_at_k(relevant_docs, retrieved_docs, relevance_scores=None, k=5):
+    """
+    Compute Normalized Discounted Cumulative Gain at k (NDCG@k)
+    
+    Args:
+        relevant_docs: List of relevant document IDs
+        retrieved_docs: List of retrieved document IDs in ranked order
+        relevance_scores: Dictionary mapping document IDs to relevance scores (if None, binary relevance is assumed)
+        k: Number of top results to consider
+        
+    Returns:
+        NDCG@k score (float)
+    """
+    if not retrieved_docs or k <= 0:
+        return 0.0
+    
+    # Consider only top k documents
+    top_k_docs = retrieved_docs[:k]
+    
+    # Calculate DCG
+    dcg = 0.0
+    for i, doc in enumerate(top_k_docs):
+        # Position in the ranking (1-indexed)
+        pos = i + 1
+        
+        # Get relevance score (binary if not provided)
+        if relevance_scores and doc in relevance_scores:
+            rel = relevance_scores[doc]
+        else:
+            rel = 1.0 if doc in relevant_docs else 0.0
+        
+        # DCG formula: rel_i / log_2(i+1)
+        dcg += rel / math.log2(pos + 1)
+    
+    # Calculate ideal DCG (IDCG)
+    # For ideal ranking, sort relevant documents by their relevance scores
+    if relevance_scores:
+        # Get relevance scores for relevant documents
+        relevant_with_scores = [(doc, relevance_scores.get(doc, 0.0)) for doc in relevant_docs]
+        # Sort by relevance score in descending order
+        sorted_relevant = [doc for doc, score in sorted(relevant_with_scores, key=lambda x: x[1], reverse=True)]
+    else:
+        # With binary relevance, any ordering of relevant docs is ideal
+        sorted_relevant = relevant_docs
+    
+    # Calculate IDCG
+    idcg = 0.0
+    for i, doc in enumerate(sorted_relevant[:k]):
+        pos = i + 1
+        if relevance_scores and doc in relevance_scores:
+            rel = relevance_scores[doc]
+        else:
+            rel = 1.0
+        
+        idcg += rel / math.log2(pos + 1)
+    
+    # If there are no relevant documents, IDCG is 0, and NDCG is defined as 0
+    if idcg == 0:
+        return 0.0
+    
+    # NDCG = DCG / IDCG
+    return dcg / idcg
+
+def evaluate_search_system(queries, ground_truth, search_function):
+    """
+    Evaluate a search system using multiple metrics
+    
+    Args:
+        queries: List of query strings
+        ground_truth: Dictionary mapping query strings to lists of relevant document IDs
+        search_function: Function that takes a query and returns a list of document IDs
+        
+    Returns:
+        Dictionary with evaluation metrics
+    """
+    all_queries_retrieved_docs = {}
+    all_queries_relevant_docs = {}
+    
+    p_at_5_sum = 0.0
+    ndcg_at_5_sum = 0.0
+    
+    for i, query in enumerate(queries):
+        query_id = f"q{i}"
+        
+        # Get relevant documents for this query
+        if query in ground_truth:
+            relevant_docs = ground_truth[query]
+        else:
+            relevant_docs = []
+        
+        # Get retrieved documents using the search function
+        retrieved_docs = [doc["path"] for doc in search_function(query)]
+        
+        # Store for MAP calculation
+        all_queries_retrieved_docs[query_id] = retrieved_docs
+        all_queries_relevant_docs[query_id] = relevant_docs
+        
+        # Calculate P@5
+        p_at_5 = compute_precision_at_k(relevant_docs, retrieved_docs, k=5)
+        p_at_5_sum += p_at_5
+        
+        # Calculate NDCG@5
+        ndcg_at_5 = compute_ndcg_at_k(relevant_docs, retrieved_docs, k=5)
+        ndcg_at_5_sum += ndcg_at_5
+    
+    # Calculate MAP
+    map_score = compute_mean_average_precision(all_queries_relevant_docs, all_queries_retrieved_docs)
+    
+    # Calculate average P@5 and NDCG@5
+    avg_p_at_5 = p_at_5_sum / len(queries) if queries else 0.0
+    avg_ndcg_at_5 = ndcg_at_5_sum / len(queries) if queries else 0.0
+    
+    return {
+        "MAP": map_score,
+        "P@5": avg_p_at_5,
+        "NDCG@5": avg_ndcg_at_5
+    }
+
 # ---------------------------
 # Flask Web Interface for Image Search
 # ---------------------------
@@ -864,11 +1076,13 @@ HTML_TEMPLATE = """
 def home():
     return render_template_string(HTML_TEMPLATE)
 
+# Modify the Flask route for search to include evaluation metrics
 @app.route('/search')
 def search():
     query = request.args.get('query', '')
     results = []
     error = None
+    metrics = None
     
     if query:
         # Load image data from JSON file
@@ -879,22 +1093,83 @@ def search():
                 
                 # Perform search
                 results = compute_bm25(query, image_data)[:20]  # Limit to top 20 results
+                
+                # For demonstration purposes, we'll use a mock ground truth
+                # In a real system, you would have actual ground truth data
+                mock_ground_truth = {
+                    query: [results[i]["path"] for i in range(min(3, len(results)))]  # Assume top 3 are relevant
+                }
+                
+                # Define a search function that uses our BM25 implementation
+                def search_function(q):
+                    return compute_bm25(q, image_data)
+                
+                # Calculate evaluation metrics
+                metrics = evaluate_search_system([query], mock_ground_truth, search_function)
+                
             else:
                 error = "No image data found. Please run the crawler first."
         except Exception as e:
             error = f"Error during search: {str(e)}"
             print(error)
     
-    return render_template_string(HTML_TEMPLATE, results=results, query=query, error=error)
+    # Update the HTML template to include metrics
+    html_with_metrics = HTML_TEMPLATE.replace(
+        '<span class="results-count">{{ results|length }} found</span>',
+        '''<span class="results-count">{{ results|length }} found</span>
+            {% if metrics %}
+                <div class="metrics-container">
+                    <div class="metric">MAP: {{ "{:.4f}".format(metrics.MAP) }}</div>
+                    <div class="metric">P@5: {{ "{:.4f}".format(metrics.P_at_5) }}</div>
+                    <div class="metric">NDCG@5: {{ "{:.4f}".format(metrics.NDCG_at_5) }}</div>
+                </div>
+            {% endif %}'''
+    )
+    
+    # Add CSS for metrics
+    html_with_metrics = html_with_metrics.replace(
+        '.results-count {',
+        '''.metrics-container {
+            display: flex;
+            gap: 1rem;
+            margin-top: 0.5rem;
+        }
+        .metric {
+            background-color: var(--secondary);
+            color: white;
+            padding: 0.25rem 0.75rem;
+            border-radius: 9999px;
+            font-size: 0.875rem;
+            font-weight: 500;
+        }
+        .results-count {'''
+    )
+    
+    return render_template_string(
+        html_with_metrics, 
+        results=results, 
+        query=query, 
+        error=error,
+        metrics={
+            'MAP': metrics['MAP'] if metrics else 0,
+            'P_at_5': metrics['P@5'] if metrics else 0,
+            'NDCG_at_5': metrics['NDCG@5'] if metrics else 0
+        } if metrics else None
+    )
+
+# Add a new route for evaluation
+@app.route('/evaluate')
+def evaluate():
+    # This would be a more comprehensive evaluation page
+    # For now, we'll just redirect to the search page
+    return redirect(url_for('home'))
 
 # Serve images
 @app.route('/images/<path:filename>')
 def serve_image(filename):
     return send_from_directory('images', filename)
 
-# ---------------------------
-# Main Function
-# ---------------------------
+# Update the main function to include an evaluation example
 def main():
     # Check if image data already exists
     if os.path.exists('image_data.json'):
@@ -917,16 +1192,35 @@ def main():
         image_data = crawl_google_images(query=query, limit=limit)
         print(f"Collected {len(image_data)} images")
     
-    # Example search
+    # Example search and evaluation
     if image_data:
-        test_query = "mountain"
-        print(f"\nTesting search for '{test_query}':")
-        results = compute_bm25(test_query, image_data)
+        test_queries = ["mountain", "beach", "forest"]
+        print("\nEvaluating search system with test queries:")
         
-        print(f"Found {len(results)} results")
-        for i, result in enumerate(results[:5]):  # Show top 5 results
-            print(f"{i+1}. {result['path']} (Score: {result['score']:.3f})")
-            print(f"   Text: {result['text']}")
+        # Mock ground truth for demonstration
+        mock_ground_truth = {}
+        
+        # For each query, perform a search and use top 3 results as mock ground truth
+        for query in test_queries:
+            results = compute_bm25(query, image_data)
+            mock_ground_truth[query] = [results[i]["path"] for i in range(min(3, len(results)))]
+            
+            print(f"\nQuery: '{query}'")
+            for i, result in enumerate(results[:5]):  # Show top 5 results
+                print(f"{i+1}. {result['path']} (Score: {result['score']:.3f})")
+                print(f"   Text: {result['text']}")
+        
+        # Define search function for evaluation
+        def search_function(query):
+            return compute_bm25(query, image_data)
+        
+        # Evaluate the search system
+        metrics = evaluate_search_system(test_queries, mock_ground_truth, search_function)
+        
+        print("\nSearch System Evaluation:")
+        print(f"MAP: {metrics['MAP']:.4f}")
+        print(f"P@5: {metrics['P@5']:.4f}")
+        print(f"NDCG@5: {metrics['NDCG@5']:.4f}")
     else:
         print("No images to search")
     
